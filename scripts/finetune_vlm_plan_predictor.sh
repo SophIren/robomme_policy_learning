@@ -9,12 +9,20 @@
 DATASET_PATH='data/robomme_preprocessed_data/qwenvl_plan/plan_train.jsonl'
 OUTPUT_DIR='runs/ckpts/vlm_plan_predictor/qwenvl/grounded_plan'
 
-PYTORCH_CUDA_ALLOC_CONF='expandable_segments:True' \
+# GPUs: override from the shell, e.g. `GPU_IDS=0,1 bash scripts/finetune_vlm_plan_predictor.sh`.
+# Default: all visible GPUs. NUM_GPUS must equal the number of ids in GPU_IDS.
+GPU_IDS=${GPU_IDS:-$(nvidia-smi --query-gpu=index --format=csv,noheader | paste -sd, -)}
+NUM_GPUS=$(echo "$GPU_IDS" | awk -F, '{print NF}')
+# Keep the global batch (per_device * grad_accum * NUM_GPUS) at 64 like the 4-GPU original: 4 * GRAD_ACC * NUM_GPUS
+GRAD_ACC=${GRAD_ACC:-$((16 / NUM_GPUS))}
+echo "GPU_IDS=$GPU_IDS NUM_GPUS=$NUM_GPUS GRAD_ACC=$GRAD_ACC"
+
+PYTORCH_ALLOC_CONF='expandable_segments:True' \
 IMAGE_MAX_TOKEN_NUM=256 \
 VIDEO_MAX_TOKEN_NUM=64 \
 FPS_MAX_FRAMES=10 \
-NPROC_PER_NODE=4 \
-CUDA_VISIBLE_DEVICES=0,1,2,3 \
+NPROC_PER_NODE=$NUM_GPUS \
+CUDA_VISIBLE_DEVICES=$GPU_IDS \
 swift sft \
     --model 'Qwen/Qwen3-VL-4B-Instruct' \
     --dataset $DATASET_PATH \
@@ -25,7 +33,7 @@ swift sft \
     --torch_dtype bfloat16 \
     --num_train_epochs 2 \
     --per_device_train_batch_size 4 \
-    --gradient_accumulation_steps 4 \
+    --gradient_accumulation_steps $GRAD_ACC \
     --attn_impl sdpa \
     --padding_free false \
     --learning_rate 1e-4 \
