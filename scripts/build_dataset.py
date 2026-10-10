@@ -38,7 +38,7 @@ def _parse_args() -> argparse.Namespace:
         "--dataset_type",
         type=str,
         default="robomme_pkl",
-        choices=["robomme_pkl", "vlm_subgoal_qwenvl", "vlm_subgoal_memer"],
+        choices=["robomme_pkl", "vlm_subgoal_qwenvl", "vlm_subgoal_memer", "vlm_plan_qwenvl"],
         help="Dataset type to build",
     )
     parser.add_argument(
@@ -95,6 +95,19 @@ if __name__ == "__main__":
             max_episodes=args.max_episodes,
             visualize=args.visualize,
             vlm_dir_name="memer",
+        )
+        builder.run()
+    elif args.dataset_type == "vlm_plan_qwenvl":
+        from mme_vla_suite.dataset_builder.build_vlm_plan_dataset_qwenvl import (
+            DatasetBuilder as PlanDatasetBuilder,
+        )
+
+        builder = PlanDatasetBuilder(
+            raw_data_path=args.raw_data_path,
+            preprocessed_data_path=args.preprocessed_data_path,
+            max_episodes=args.max_episodes,
+            visualize=args.visualize,
+            vlm_dir_name="qwenvl_plan",
         )
         builder.run()
     else:
