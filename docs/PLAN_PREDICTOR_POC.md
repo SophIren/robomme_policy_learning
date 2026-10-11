@@ -212,6 +212,16 @@ each sample: task, whether it has a video, step-by-step GT vs PRED (`!!` marks a
 pixel points `[y, x]`, per-point L1 error in pixels, and the raw model output. The last line is a summary:
 `text_exact` (whole plan text equal), `same_len` (same number of steps), `mean_L1px`.
 
+Images: for every sample a picture is saved to `--vis_dir` (default `runs/plan_preview_vis/`, `--vis_dir ''` to skip),
+named `<Task>_ep<i>_step<j>_vis.png`. It is the planner's input frame upscaled x3 with:
+- green circles = GT points, red crosses = predicted points, the number next to each point = plan step it belongs to;
+- a yellow line between the k-th GT point and the k-th predicted point (pairs by order, same as `L1px`);
+- a text panel below: GT and PRED plan step by step with their `[y, x]` pixel coords and per-point L1.
+
+Copy them to the laptop to look at: `scp -r <cloud-host>:<repo>/runs/plan_preview_vis .`
+Points of later steps are drawn on the first frame even though the object will be elsewhere by then; that is
+expected and shows what the planner "assumes" about future positions.
+
 How to read it:
 - `RAW` should contain `<|box_start|>(y,x)<|box_end|>` tokens (Qwen3-VL format, 0..1000); the script converts them to
   0..255 pixels the same way `examples/robomme/subgoal_prediction/qwenvl/api.py` does. No box tokens in `RAW`
