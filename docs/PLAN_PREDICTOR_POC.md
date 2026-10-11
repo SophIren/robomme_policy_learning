@@ -11,7 +11,8 @@ New files:
 - `scripts/build_dataset.py` (new `--dataset_type vlm_plan_qwenvl`)
 - `scripts/split_plan_dataset.py` (train/val split by episode)
 - `scripts/preview_plan_predictions.py` (GT vs prediction on a few samples)
-- `scripts/watch_plan_previews.py` (the same pictures for every checkpoint during training)
+- `scripts/watch_plan_previews.py` (the same pictures for several saved checkpoints, run by hand)
+- `scripts/zeroshot_grounding_check.py` (can the base model point at objects, no adapter)
 
 Nothing was run locally (no data, no GPU). Run all steps below in the cloud, in order.
 
@@ -221,58 +222,86 @@ count, pixel error) is measured by step 7 on `plan_val.jsonl`. Run step 7 on 1-2
 Most of the text is a template, so `loss` is dominated by coordinate tokens: a train loss that stays ~0.3-0.4 means
 the coordinates are not learned even on train.
 
-## 5a. Plan pictures during training (train + val, every checkpoint)
+## 5a. Plan pictures for saved checkpoints (separately from training)
 
-`eval_loss` alone does not show whether the points land on objects, so the training script can render the same
-GT-vs-PRED pictures as step 7 for every saved checkpoint, on a few fixed train and val samples. Enable it with
-`PREVIEW_GPU`:
-
-```bash
-PREVIEW_GPU=1 GPU_IDS=0,1 bash scripts/finetune_vlm_plan_predictor.sh              # preview on GPU 1, shared with training
-PREVIEW_GPU=2 GPU_IDS=0,1 bash scripts/finetune_vlm_plan_predictor.sh              # separate GPU (best, if you have it)
-PREVIEW_GPU=1 PREVIEW_N=10 EVAL_STEPS=200 GPU_IDS=0,1 bash scripts/finetune_vlm_plan_predictor.sh
-```
-
-How it works: the script starts `scripts/watch_plan_previews.py` in the background. It polls the run dir and, for each
-new `checkpoint-<N>` (saved every `EVAL_STEPS`), loads it on `PREVIEW_GPU`, greedy-decodes `PREVIEW_N` train rows
-(from `DATASET_PATH`) and `PREVIEW_N` val rows (from `VAL_DATASET`), one per task, and writes:
-
-```
-<OUTPUT_DIR>/v<k>-<time>/
-├── preview/
-│   ├── checkpoint-100/{train,val}/<Task>_ep<i>_step<j>_vis.png   # pictures like in step 7
-│   ├── checkpoint-100/{train,val}.jsonl                          # raw / parsed GT and PRED
-│   ├── checkpoint-200/...
-│   └── metrics.jsonl                                             # one line per (checkpoint, split)
-└── runs/preview/                                                 # tensorboard: preview/{train,val}/<metric>
-```
-
-The samples are the same for every checkpoint (fixed seed), so you can flip through `checkpoint-*/train/<same file>`
-to see the points move towards the objects as training goes on. Metrics per split: `text_exact`, `same_len`,
-`mean_L1px`, `first_point_L1px` (error of the first point only, the one always visible on the input frame).
+To see GT-vs-PRED pictures (as in step 7) for several checkpoints of a run, on the same fixed train and val samples,
+run this **after training or in another terminal on a free GPU**. It is not started by the training script.
 
 ```bash
 RUN=$(ls -d runs/ckpts/vlm_plan_predictor/qwenvl/grounded_plan_lora/v* | sort -V | tail -n 1)
-tail -f runs/ckpts/vlm_plan_predictor/qwenvl/grounded_plan_lora/preview_watcher.log
-cat $RUN/preview/metrics.jsonl
-scp -r <cloud-host>:<repo>/$RUN/preview .                                          # look at the pictures locally
+CUDA_VISIBLE_DEVICES=0 python scripts/watch_plan_previews.py \
+  --output_dir runs/ckpts/vlm_plan_predictor/qwenvl/grounded_plan_lora --run_dir $RUN --once
 ```
 
-Notes:
-- It runs in a separate process on the saved checkpoints, not inside the trainer, so it does not slow down or change
-  training; it only needs the checkpoints to exist. The decoding is greedy generation, i.e. the real model output,
-  unlike the teacher-forced `eval_token_acc`.
-- Memory: the 4B model in bf16 needs ~10 GB on `PREVIEW_GPU` (more for long video inputs). If it shares a GPU with
-  training and training OOMs, use another GPU or disable it (`PREVIEW_GPU=` is the default).
-- Each checkpoint takes ~1-2 min for 12 samples. If checkpoints come faster than that, it skips to the newest one;
-  with `--save_total_limit 3` older checkpoints may be gone before it gets to them (it logs and moves on).
-- After training ends it does a final pass over remaining checkpoints, then exits; the script waits for it.
-- For a run that already finished (or was started without previews):
-  ```bash
-  CUDA_VISIBLE_DEVICES=0 python scripts/watch_plan_previews.py --output_dir <OUTPUT_DIR> --run_dir $RUN --once
-  ```
-  With `--save_total_limit 3` only the last 3 checkpoints exist then.
-- Full-FT checkpoints work the same way (detected automatically).
+Output: `$RUN/preview/checkpoint-<N>/{train,val}/*_vis.png`, `$RUN/preview/metrics.jsonl` (per checkpoint and split:
+`text_exact`, `same_len`, `mean_L1px`, `first_point_L1px`). Without `--once` it keeps polling for new checkpoints;
+only do that on a GPU that training does not use (~10 GB for the 4B model). With `--save_total_limit 3` only the last
+3 checkpoints exist.
+
+## 5b. Validation: how it runs, and checking it right away
+
+Validation is a built-in feature of ms-swift (it uses the HuggingFace `Trainer` underneath); nothing custom in
+this repo. The training script passes:
+- `--val_dataset plan_val.jsonl`: swift preprocesses it with the same template as train (images, video, `objects.bbox`);
+- `--eval_strategy steps --eval_steps $EVAL_STEPS`: every `EVAL_STEPS` optimizer steps the Trainer stops training,
+  runs a forward pass over the **whole** val set (no generation: teacher-forced, same loss as train), logs
+  `eval_loss` / `eval_token_acc`, then continues;
+- `--save_steps $EVAL_STEPS`: the checkpoint is saved at the same step, right after eval;
+- `--per_device_eval_batch_size $PER_DEVICE`.
+
+So at step 100 (default) three things happen for the first time: val preprocessing/loading, the eval forward pass
+(extra GPU memory on top of training), and the DeepSpeed checkpoint save. To check eval without waiting:
+
+```bash
+EVAL_ON_START=true GPU_IDS=0,1 bash scripts/finetune_vlm_plan_predictor.sh 2>&1 | tee train.log
+```
+
+`EVAL_ON_START=true` adds `--eval_on_start true` (HF Trainer option, passed through by swift): one full eval runs
+**before** step 1. If it prints an `eval_loss` line and training continues, eval itself works. To check the
+checkpoint save quickly as well, add `EVAL_STEPS=5`: eval + save at step 5. If it still fails, run once more with
+`VAL_DATASET=` (no eval, save only) to tell eval and save apart, and look at the first `Traceback` in `train.log`.
+If your swift version rejects `--eval_on_start`, use `EVAL_STEPS=1` instead (eval + save after the first step).
+
+## 5c. Zero-shot check: can the base model (no adapter) point at the cube, the button, ...?
+
+`scripts/zeroshot_grounding_check.py` loads the plain `Qwen/Qwen3-VL-4B-Instruct` (no LoRA) and, for every object
+in the GT plan of a few rows (`the red cube`, `the button`, `the right-side target`, ...), asks a pure grounding
+question on the planner's input frame, without video or task context:
+
+```
+<image>Locate the red cube in the image and output its center point as JSON: [{"point_2d": [x, y], "label": "the red cube"}]
+```
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python scripts/zeroshot_grounding_check.py \
+  --jsonl data/robomme_preprocessed_data/qwenvl_plan/plan_val.jsonl --n 10 --out_dir runs/zeroshot_grounding
+```
+
+Output:
+- terminal: per object `GT [y, x]`, `PRED [y, x]`, L1 in pixels, and the raw answer; summary `mean_L1px` and
+  `first_object_L1px` (first object of each plan);
+- `runs/zeroshot_grounding/*_zeroshot.png`: the same picture as step 7 (green = GT, red = zero-shot answer);
+- `runs/zeroshot_grounding/answers.jsonl`: everything above, one line per question.
+
+Options:
+- `--prompt_format point|bbox|plain`: native point JSON (default), native bbox JSON (the center is used), or plain
+  "Point to the red cube." Try `bbox` if `point` gives odd results; Qwen3-VL grounding is commonly prompted with
+  `bbox_2d`.
+- `--coords rel|abs`: Qwen3-VL answers in coordinates relative to 0..1000 (`rel`, default). If the raw answers look
+  like pixel values of a 256x256 image, use `abs`.
+- `--first_only`: ask only about the first object (always visible on the frame).
+
+How to read it:
+- Only objects that are visible on this frame at their GT position are meaningful: the first step, buttons, static
+  targets/bins. Later "moved" positions (second pick of the same cube, swapped containers) are not on this frame.
+- If the base model lands on the cube / button for these objects, the model can do it, and the problem of the
+  fine-tuned planner is the training setup (our coordinate format is `<|box_start|>(y,x)<|box_end|>`, y first, which
+  differs from the native `point_2d` [x, y]; little data; many points per answer). Then switching the plan data to the
+  native format (`[x, y]`, 0..1000, JSON) is the next thing to try.
+- If it also misses, perception is the bottleneck (small objects on a 256x256 synthetic frame); then more grounding
+  data or a larger frame would help more than format changes.
+- Ambiguous phrases like `the correct target` or `the container` (several identical ones) cannot be resolved without
+  the video / context; judge mostly by unique objects (colored cube, button, bin).
 
 ## 6. Check predictions with swift infer (optional)
 

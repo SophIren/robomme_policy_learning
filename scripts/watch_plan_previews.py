@@ -1,9 +1,8 @@
-"""Watch a training run and, for every new checkpoint, decode a few fixed train and val samples and save
-GT-vs-PRED plan images (same pictures as scripts/preview_plan_predictions.py) plus summary metrics.
-
-Started automatically by scripts/finetune_vlm_plan_predictor.sh when PREVIEW_GPU is set, or by hand:
+"""Decode a few fixed train and val samples for saved checkpoints of a training run and save GT-vs-PRED plan images
+(same pictures as scripts/preview_plan_predictions.py) plus summary metrics. Not started by the training script;
+run it by hand after training (--once), or in parallel only on a GPU the training does not use:
     CUDA_VISIBLE_DEVICES=0 python scripts/watch_plan_previews.py \
-        --output_dir runs/ckpts/vlm_plan_predictor/qwenvl/grounded_plan_lora
+        --output_dir runs/ckpts/vlm_plan_predictor/qwenvl/grounded_plan_lora --run_dir <run> --once
 
 Results for the run dir <OUTPUT_DIR>/v<k>-<time>/:
     preview/checkpoint-<N>/train/*_vis.png, preview/checkpoint-<N>/val/*_vis.png, .../{train,val}.jsonl
