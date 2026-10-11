@@ -6,8 +6,21 @@
 # data/robomme_preprocessed_data/qwenvl/grounded_subgoal_train.jsonl
 # data/robomme_preprocessed_data/qwenvl_plan/plan_train.jsonl (full-plan PoC)
 
-DATASET_PATH='data/robomme_preprocessed_data/qwenvl_plan/plan_train.jsonl'
-OUTPUT_DIR='runs/ckpts/vlm_plan_predictor/qwenvl/grounded_plan'
+# With a held-out split (scripts/split_plan_dataset.py) train on plan_train_split.jsonl and eval on plan_val.jsonl.
+# Set VAL_DATASET='' to train on everything without eval.
+DATA_DIR='data/robomme_preprocessed_data/qwenvl_plan'
+DATASET_PATH=${DATASET_PATH:-$DATA_DIR/plan_train_split.jsonl}
+VAL_DATASET=${VAL_DATASET-$DATA_DIR/plan_val.jsonl}
+OUTPUT_DIR=${OUTPUT_DIR:-'runs/ckpts/vlm_plan_predictor/qwenvl/grounded_plan'}
+EVAL_STEPS=${EVAL_STEPS:-25}
+
+if [ -n "$VAL_DATASET" ]; then
+    # eval_loss / eval_token_acc on val every EVAL_STEPS; checkpoints saved at the same steps
+    EVAL_ARGS="--val_dataset $VAL_DATASET --eval_strategy steps --eval_steps $EVAL_STEPS --save_steps $EVAL_STEPS --per_device_eval_batch_size 4"
+else
+    EVAL_ARGS="--save_steps 50"
+fi
+echo "train=$DATASET_PATH val=${VAL_DATASET:-none}"
 
 # GPUs: override from the shell, e.g. `GPU_IDS=0,1 bash scripts/finetune_vlm_plan_predictor.sh`.
 # Default: all visible GPUs. NUM_GPUS must equal the number of ids in GPU_IDS.
@@ -44,8 +57,8 @@ swift sft \
     --freeze_aligner true \
     --gradient_checkpointing true \
     --vit_gradient_checkpointing false \
-    --save_steps 50 \
-    --save_total_limit 2 \
+    $EVAL_ARGS \
+    --save_total_limit 3 \
     --logging_steps 5 \
     --max_length 4096 \
     --output_dir $OUTPUT_DIR \

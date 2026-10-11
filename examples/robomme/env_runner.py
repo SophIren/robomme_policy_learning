@@ -23,7 +23,7 @@ class EnvRunner:
     expose initial observation and step API, and optional subgoal oracles.
     """
 
-    def __init__(self, env_id: str, video_save_dir: str, max_steps: int = 1300) -> None:
+    def __init__(self, env_id: str, video_save_dir: str, max_steps: int = 1300, dataset: str = "test") -> None:
         if env_id not in TASK_NAME_LIST:
             raise ValueError(f"Environment ID {env_id} not in {TASK_NAME_LIST}")
         self.env_id = env_id
@@ -31,7 +31,7 @@ class EnvRunner:
 
         self.env_builder = BenchmarkEnvBuilder(
             env_id=env_id,
-            dataset="test",
+            dataset=dataset,
             action_space="joint_angle",
             gui_render=False,
             max_steps=max_steps,
