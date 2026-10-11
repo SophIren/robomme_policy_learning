@@ -38,17 +38,19 @@ from openpi_client import websocket_client_policy as _websocket_client_policy
 from env_runner import EnvRunner
 from utils import EpisodeState, RolloutRecorder, TASK_WITH_VIDEO_DEMO, pack_buffer
 
-# Must match src/mme_vla_suite/dataset_builder/build_vlm_plan_dataset_qwenvl.py
-PLAN_SYSTEM_PROMPT = (
-    "You are a helpful assistant to help guide the robot to complete the task "
-    "by predicting the full plan as a sequence of grounded language subgoals"
-)
-PLAN_USER_PROMPT = (
-    "{video_prefix}The task goal is: {task_goal}\n"
-    "<image>What's the full plan of grounded language subgoals "
-    "to complete the task based on current observation?"
-)
-BOX_RE = re.compile(r"<\|box_start\|>\((\d+),(\d+)\)<\|box_end\|>")
+
+def _load_plan_format():
+    """Prompt + answer format shared with the dataset builder (src/.../dataset_builder/plan_format.py, pure python)."""
+    import importlib.util
+
+    path = Path(__file__).resolve().parents[2] / "src" / "mme_vla_suite" / "dataset_builder" / "plan_format.py"
+    spec = importlib.util.spec_from_file_location("plan_format", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+pf = _load_plan_format()
 POINT_RE = re.compile(r"<(\d+), (\d+)>")
 IMAGE_SIZE = 256
 BASE_MODEL = "Qwen/Qwen3-VL-4B-Instruct"
@@ -71,8 +73,9 @@ def load_engine(ckpt: str):
 
 
 class PlanPredictor:
-    def __init__(self, ckpt: str):
+    def __init__(self, ckpt: str, fmt: str = "native"):
         self.engine = load_engine(ckpt)
+        self.fmt = fmt  # must match the --plan_format the model was trained on
 
     def predict(self, task_goal: str, image: np.ndarray, video: list | None, work_dir: Path) -> tuple[list[str], str]:
         from swift.llm import InferRequest, RequestConfig
@@ -80,28 +83,19 @@ class PlanPredictor:
         work_dir.mkdir(parents=True, exist_ok=True)
         image_path = str(work_dir / "plan_image.png")
         imageio.imwrite(image_path, image)
-        req = {
-            "messages": [
-                {"role": "system", "content": PLAN_SYSTEM_PROMPT},
-                {"role": "user", "content": PLAN_USER_PROMPT.format(
-                    video_prefix="<video>" if video else "", task_goal=task_goal.lower())},
-            ],
-            "images": [image_path],
-        }
+        req = {"messages": pf.build_messages(task_goal.lower(), bool(video), self.fmt), "images": [image_path]}
         if video:
             video_path = str(work_dir / "plan_video.mp4")
             imageio.mimsave(video_path, video, fps=30)
             req["videos"] = [video_path]
-        out = self.engine.infer([InferRequest(**req)], request_config=RequestConfig(max_tokens=512, temperature=0))
+        out = self.engine.infer([InferRequest(**req)], request_config=RequestConfig(max_tokens=1024, temperature=0))
         raw = out[0].choices[0].message.content
         return parse_plan(raw), raw
 
 
 def parse_plan(raw: str) -> list[str]:
-    """'1. pick up the cube at <|box_start|>(y,x)<|box_end|>; 2. ...' -> ['pick up the cube at <Y, X>', ...] (pixels)."""
-    text = BOX_RE.sub(
-        lambda m: f"<{int(int(m.group(1)) * IMAGE_SIZE / 1000)}, {int(int(m.group(2)) * IMAGE_SIZE / 1000)}>", raw)
-    return [re.sub(r"^\d+\.\s*", "", s.strip()) for s in text.split(";") if s.strip()]
+    """Model output (native point_2d JSON or legacy <|box_start|>) -> VLA subgoals '... at <y, x> ...' in pixels."""
+    return [pf.to_vla_subgoal(s) for s in pf.parse_answer(raw, size=IMAGE_SIZE)]
 
 
 # -----------------------------------------------------------------------------
@@ -369,6 +363,8 @@ def main():
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=8006, help="VLA policy server port")
     p.add_argument("--adapter", default=None, help="plan VLM checkpoint dir (LoRA adapter or full fine-tune)")
+    p.add_argument("--plan_format", default="native", choices=["native", "legacy"],
+                   help="prompt/answer format the plan model was trained with (build_dataset.py --plan_format)")
     p.add_argument("--plan_file", default=None, help="json list of subgoals instead of the VLM (debug switching)")
     p.add_argument("--task", default="MoveCube")
     p.add_argument("--exclude_tasks", default="ButtonUnmaskSwap,PickHighlight",
@@ -388,7 +384,7 @@ def main():
     if args.task in {t for t in args.exclude_tasks.split(",") if t} and not args.force:
         raise SystemExit(f"{args.task} is excluded for the plan model (--exclude_tasks); pass --force to run it anyway")
 
-    planner = PlanPredictor(args.adapter) if args.adapter else None
+    planner = PlanPredictor(args.adapter, args.plan_format) if args.adapter else None
     ui, step_ref = UIState(), {"step": 0}
     server = ThreadingHTTPServer((args.ui_host, args.ui_port), make_handler(ui, step_ref))
     threading.Thread(target=server.serve_forever, daemon=True).start()

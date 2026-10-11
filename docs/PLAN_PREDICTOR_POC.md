@@ -1,12 +1,34 @@
 # Full-plan VLM predictor (PoC)
 
 One sample = one episode. Input: video demo (if any) + task goal + first execution frame.
-Output: the whole plan with pixel coordinates, e.g.
-`1. pick up the cube at <bbox>; 2. place the cube onto the correct target at <bbox>; ...`
-Coordinates are `[y, x]` in 0..255 and go through ms-swift `objects.bbox`, same as the existing grounded-subgoal dataset.
+Output: the whole plan with object points in **Qwen3-VL's native grounding format** (default, `--plan_format native`):
+
+```json
+[{"step": 1, "subgoal": "pick up the red cube <point> for the first time", "label": "the red cube", "point_2d": [469, 426]},
+ {"step": 2, "subgoal": "place the red cube onto the target <point>", "label": "the target", "point_2d": [574, 410]},
+ {"step": 3, "subgoal": "drop the cube onto table"},
+ {"step": 4, "subgoal": "press the button <point> to stop", "label": "the button", "point_2d": [516, 254]}]
+```
+
+Why this format: zero-shot the base model already points well at cubes / buttons when asked in its own format
+(`[{"point_2d": [x, y], "label": ...}]`, x first, relative 0..1000, plain text). The first version of the dataset used
+`objects.bbox` = `[y, x]` pixels rendered by swift as `<|box_start|>(y,x)<|box_end|>`, i.e. a different syntax and
+the opposite axis order, so the model had to relearn grounding from ~1k samples. Now each object point is written
+exactly like in pretraining; only the surrounding plan structure is new.
+- `point_2d` = `[x, y]`, `x = col * 1000 / 256`, `y = row * 1000 / 256` (rounded); converted back to RoboMME
+  `[y, x]` pixels in 0..255 everywhere outside the model (`plan_format.rel_to_px`).
+- `label` = the object phrase from the subgoal (`the red cube`, `the button`, `the right-side target`), as in pretraining.
+- `<point>` marks where `at <y, x>` was in the original grounded subgoal, so the exact VLA string is rebuilt from it
+  (`plan_format.to_vla_subgoal`: `pick up the red cube at <109, 120> for the first time`).
+- No custom system prompt (default chat template), the instruction is in the user turn.
+- The old format is still available: `--plan_format legacy` (written to `qwenvl_plan/`, same as before).
+
+All of it lives in one pure-python module, `src/mme_vla_suite/dataset_builder/plan_format.py`, used by the builder,
+the preview scripts and `interactive_plan.py`; the parsers auto-detect native/legacy answers.
 
 New files:
 - `src/mme_vla_suite/dataset_builder/build_vlm_plan_dataset_qwenvl.py`
+- `src/mme_vla_suite/dataset_builder/plan_format.py` (prompt + answer format, coordinate conversion, parsers)
 - `scripts/finetune_vlm_plan_predictor.sh`
 - `scripts/build_dataset.py` (new `--dataset_type vlm_plan_qwenvl`)
 - `scripts/split_plan_dataset.py` (train/val split by episode)
@@ -49,40 +71,45 @@ Check that `info` has `simple_subgoal`, `grounded_subgoal`, `is_video_demo`.
 ## 2. Build dataset (smoke test first)
 
 ```bash
-uv run python scripts/build_dataset.py --dataset_type vlm_plan_qwenvl --max_episodes 2
+uv run python scripts/build_dataset.py --dataset_type vlm_plan_qwenvl --max_episodes 2      # --plan_format native (default)
 ```
 
-Output: `data/robomme_preprocessed_data/qwenvl_plan/plan_train.jsonl` and `.../images/`.
+Output: `data/robomme_preprocessed_data/qwenvl_plan_native/plan_train.jsonl` and `.../images/`.
 Check after the smoke run:
 
 ```bash
-D=data/robomme_preprocessed_data/qwenvl_plan
+D=data/robomme_preprocessed_data/qwenvl_plan_native
 wc -l $D/plan_train.jsonl               # ~ (#task files) * 2
 ls $D/images | head
 ls $D/images | grep -c mp4              # videos only for tasks with a demo
 head -n 1 $D/plan_train.jsonl | python -m json.tool
 ```
 
-Inspect a few plans, with one line per sample:
+Inspect a few plans, one line per sample (GT parsed back into `[y, x]` pixels):
 
 ```bash
 uv run python - <<'EOF'
-import json
-for l in open("data/robomme_preprocessed_data/qwenvl_plan/plan_train.jsonl"):
+import json, importlib.util
+spec = importlib.util.spec_from_file_location("pf", "src/mme_vla_suite/dataset_builder/plan_format.py")
+pf = importlib.util.module_from_spec(spec); spec.loader.exec_module(pf)
+for l in open("data/robomme_preprocessed_data/qwenvl_plan_native/plan_train.jsonl"):
     r = json.loads(l)
-    a = r["messages"][2]["content"]
-    nb = a.count("<bbox>")
-    nobj = len(r["objects"]["bbox"])
-    flag = "" if nb == nobj else "  <-- BBOX MISMATCH"
-    print(r["images"][0].split("/")[-1], "| bboxes", nb, nobj, "|", a[:160], flag)
+    steps = pf.parse_row(r)
+    ans = r["messages"][-1]["content"]
+    json.loads(ans)                     # must be valid JSON
+    pts = [p for s in steps for p in s["points"]]
+    bad = [p for p in pts if not (0 <= p[0] < 256 and 0 <= p[1] < 256)]
+    print(r["images"][0].split("/")[-1], "| steps", len(steps), "| pts", pts, "| BAD" if bad else "",
+          "|", [pf.to_vla_subgoal(s) for s in steps][:2])
 EOF
 ```
 
 Must hold:
-- `count("<bbox>") == len(objects.bbox)` for every row (hard requirement for ms-swift).
-- Plans look sane: steps in the right order, no `complete`, coordinates inside 0..255.
-- Video path exists for tasks that have a demo; the user prompt contains `<video>` iff `videos` is present.
-- The image is the first execution frame (robot at start pose, not a demo frame).
+- every answer is valid JSON; every step with `point_2d` has a `label` (if a label is missing, the subgoal phrase did
+  not match `the ... <point>`; harmless, but check a few);
+- the rebuilt VLA subgoals (`to_vla_subgoal`) equal the original grounded subgoals from the h5, up to +-1 px rounding;
+- plans look sane: steps in the right order, no `complete`;
+- the user prompt contains `<video>` iff `videos` is present; the image is the first execution frame.
 
 Known risk to eyeball: consecutive segments with the same `simple_subgoal` (e.g. "pick up the cube" twice in a row)
 are merged into one step by `_extract_plan`. If you see plans shorter than expected on counting/repeat tasks,
@@ -92,7 +119,7 @@ Then the full build:
 
 ```bash
 uv run python scripts/build_dataset.py --dataset_type vlm_plan_qwenvl
-wc -l data/robomme_preprocessed_data/qwenvl_plan/plan_train.jsonl
+wc -l data/robomme_preprocessed_data/qwenvl_plan_native/plan_train.jsonl
 ```
 
 Dataset is small: one row per episode. For augmentation pass `frame_offsets=(0, 8, 16)` and
@@ -108,7 +135,7 @@ NPROC_PER_NODE=1 CUDA_VISIBLE_DEVICES=0 \
 IMAGE_MAX_TOKEN_NUM=256 VIDEO_MAX_TOKEN_NUM=64 FPS_MAX_FRAMES=10 \
 swift sft \
   --model Qwen/Qwen3-VL-4B-Instruct \
-  --dataset data/robomme_preprocessed_data/qwenvl_plan/plan_train.jsonl \
+  --dataset data/robomme_preprocessed_data/qwenvl_plan_native/plan_train.jsonl \
   --split_dataset_ratio 0.0 --train_type lora --torch_dtype bfloat16 \
   --max_steps 10 --per_device_train_batch_size 1 --gradient_accumulation_steps 1 \
   --lora_rank 16 --lora_alpha 32 --target_modules all-linear \
@@ -144,8 +171,8 @@ Without a split the training script trains on every row (`--split_dataset_ratio 
 
 ```bash
 python scripts/split_plan_dataset.py --val_per_task 10
-wc -l data/robomme_preprocessed_data/qwenvl_plan/plan_{train_split,val}.jsonl
-cat data/robomme_preprocessed_data/qwenvl_plan/plan_val_episodes.json | head
+wc -l data/robomme_preprocessed_data/qwenvl_plan_native/plan_{train_split,val}.jsonl
+cat data/robomme_preprocessed_data/qwenvl_plan_native/plan_val_episodes.json | head
 ```
 
 It splits by **episode**, not by row (with `frame_offsets` several rows share one episode/plan), randomly with a
@@ -158,19 +185,27 @@ by `preview_plan_predictions.py` (step 7) and `interactive_plan.py` (step 8, ref
 
 ## 5. Real training (with val metrics)
 
-The previous config (2 epochs, global batch 64, LoRA r=16, lr 1e-4) gave only ~40 optimizer steps on ~1.3k rows, which
-is why the model did not even fit the training set. New defaults are sized for this small dataset:
+LoRA hyperparameters are the same as the MemER / QwenVL subgoal predictors (`finetune_vlm_subgoal_predictor.sh`):
+LoRA r=16, alpha=32, all-linear, lr 1e-4, frozen ViT and aligner. Only the schedule differs.
 
-| | LoRA (default) | full FT (`TRAIN_TYPE=full`) |
+How the number of epochs was chosen: the MemER / QwenVL runs use global batch 64 and 2 epochs on their (much larger,
+one row per 16 sim steps) datasets, and their released checkpoints are `checkpoint-1200..1400`, i.e. ~1300 optimizer
+steps. The plan dataset has ~1 row per episode (~1100 train rows after the val split and the excluded tasks), so
+2 epochs at batch 64 would be ~35 steps (the first run's problem). Default here: global batch 16 and 20 epochs
+-> ~1400 steps, about the same number of updates as MemER, each sample seen 20 times.
+
+| | LoRA (default, = MemER) | full FT (`TRAIN_TYPE=full`) |
 |---|---|---|
-| trainable | LoRA r=64, alpha=128, all-linear | whole LLM + aligner (ViT frozen) |
-| lr | 2e-4 | 1e-5 |
+| trainable | LoRA r=16, alpha=32, all-linear (~33M) | whole LLM + aligner (ViT frozen) |
+| lr | 1e-4 | 1e-5 |
 | epochs | 20 | 15 |
 | global batch | 16 | 16 |
 | per-device batch | 4 | 2 |
 | deepspeed | zero2 | zero3 |
-| scheduler | cosine, warmup 3%, no weight decay | same |
-| ~optimizer steps on 1.3k rows | ~1600 | ~1200 |
+| scheduler | cosine, warmup 5%, no weight decay | same |
+| ~optimizer steps on ~1.1k rows | ~1400 | ~1000 |
+
+If `eval_loss` is still going down at the end, raise `EPOCHS` (30-40); if it turns up early, pick that checkpoint.
 
 The script prints the row count and the expected number of optimizer steps before starting.
 
@@ -184,9 +219,9 @@ Any value can be overridden with an env var: `EPOCHS`, `LR`, `GLOBAL_BATCH`, `PE
 `OUTPUT_DIR`. Examples:
 
 ```bash
-EPOCHS=40 LR=3e-4 GPU_IDS=0,1 bash scripts/finetune_vlm_plan_predictor.sh          # push LoRA harder
+EPOCHS=40 GPU_IDS=0,1 bash scripts/finetune_vlm_plan_predictor.sh                 # more passes if val still improves
 TRAIN_TYPE=full PER_DEVICE=1 GPU_IDS=0,1 bash scripts/finetune_vlm_plan_predictor.sh  # full FT on OOM
-DATASET_PATH=data/robomme_preprocessed_data/qwenvl_plan/plan_train.jsonl VAL_DATASET= \
+DATASET_PATH=data/robomme_preprocessed_data/qwenvl_plan_native/plan_train.jsonl VAL_DATASET= \
   GPU_IDS=0,1 bash scripts/finetune_vlm_plan_predictor.sh                         # final run on all data, no eval
 ```
 
@@ -242,7 +277,7 @@ only do that on a GPU that training does not use (~10 GB for the 4B model). With
 
 Validation is a built-in feature of ms-swift (it uses the HuggingFace `Trainer` underneath); nothing custom in
 this repo. The training script passes:
-- `--val_dataset plan_val.jsonl`: swift preprocesses it with the same template as train (images, video, `objects.bbox`);
+- `--val_dataset plan_val.jsonl`: swift preprocesses it with the same template as train (images, video; for the legacy format also `objects.bbox`);
 - `--eval_strategy steps --eval_steps $EVAL_STEPS`: every `EVAL_STEPS` optimizer steps the Trainer stops training,
   runs a forward pass over the **whole** val set (no generation: teacher-forced, same loss as train), logs
   `eval_loss` / `eval_token_acc`, then continues;
@@ -274,7 +309,7 @@ question on the planner's input frame, without video or task context:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python scripts/zeroshot_grounding_check.py \
-  --jsonl data/robomme_preprocessed_data/qwenvl_plan/plan_val.jsonl --n 10 --out_dir runs/zeroshot_grounding
+  --jsonl data/robomme_preprocessed_data/qwenvl_plan_native/plan_val.jsonl --n 10 --out_dir runs/zeroshot_grounding
 ```
 
 Output:
@@ -297,7 +332,7 @@ How to read it:
 - If the base model lands on the cube / button for these objects, the model can do it, and the problem of the
   fine-tuned planner is the training setup (our coordinate format is `<|box_start|>(y,x)<|box_end|>`, y first, which
   differs from the native `point_2d` [x, y]; little data; many points per answer). Then switching the plan data to the
-  native format (`[x, y]`, 0..1000, JSON) is the next thing to try.
+  native format (`[x, y]`, 0..1000, JSON) is the fix; this is now the default (`--plan_format native`).
 - If it also misses, perception is the bottleneck (small objects on a 256x256 synthetic frame); then more grounding
   data or a larger frame would help more than format changes.
 - Ambiguous phrases like `the correct target` or `the container` (several identical ones) cannot be resolved without
@@ -312,7 +347,7 @@ CKPT=$(ls -d runs/ckpts/vlm_plan_predictor/qwenvl/grounded_plan_lora/v*/checkpoi
 echo $CKPT
 IMAGE_MAX_TOKEN_NUM=256 VIDEO_MAX_TOKEN_NUM=64 FPS_MAX_FRAMES=10 CUDA_VISIBLE_DEVICES=0 \
 swift infer --adapters $CKPT --infer_backend pt --temperature 0 --max_new_tokens 512 \
-  --val_dataset data/robomme_preprocessed_data/qwenvl_plan/plan_val.jsonl --max_batch_size 1
+  --val_dataset data/robomme_preprocessed_data/qwenvl_plan_native/plan_val.jsonl --max_batch_size 1
 ```
 
 Raw dump of predictions; step 7 gives a readable GT-vs-PRED diff with metrics.
@@ -323,7 +358,7 @@ Raw dump of predictions; step 7 gives a readable GT-vs-PRED diff with metrics.
 CKPT=$(ls -d runs/ckpts/vlm_plan_predictor/qwenvl/grounded_plan_lora/v*/checkpoint-* | sort -V | tail -n 1)
 CUDA_VISIBLE_DEVICES=0 python scripts/preview_plan_predictions.py \
   --adapter $CKPT \
-  --jsonl data/robomme_preprocessed_data/qwenvl_plan/plan_val.jsonl \
+  --jsonl data/robomme_preprocessed_data/qwenvl_plan_native/plan_val.jsonl \
   --n 10 --per_task 1 --out runs/plan_preview.jsonl
 ```
 
@@ -345,9 +380,10 @@ Points of later steps are drawn on the first frame even though the object will b
 expected and shows what the planner "assumes" about future positions.
 
 How to read it:
-- `RAW` should contain `<|box_start|>(y,x)<|box_end|>` tokens (Qwen3-VL format, 0..1000); the script converts them to
-  0..255 pixels the same way `examples/robomme/subgoal_prediction/qwenvl/api.py` does. No box tokens in `RAW`
-  means the model did not learn the grounding format.
+- `RAW` (native format) should be a JSON list with `"point_2d": [x, y]` (0..1000, x first) and a `"label"` for every
+  object step; the script converts them to `[y, x]` pixels in 0..255. If `RAW` is not valid JSON the parser keeps the
+  complete `{...}` items (truncated output: raise `--max_tokens`). Legacy-format models output
+  `<|box_start|>(y,x)<|box_end|>` instead; both are parsed automatically.
 - On train rows expect almost exact text and a few px of error; on val rows, step text should still match for
   fixed-structure tasks, while video/memory tasks (VideoPlaceOrder, VideoRepick, ...) and coordinates of objects
   that will move later are where errors show up.
@@ -430,5 +466,6 @@ same episode with `--plan_file` built from the oracle hints; that isolates plann
 Troubleshooting:
 - page loads but no image: the planner is still running (first call loads the model); watch terminal 1.
 - `connection refused` on start: the VLA server in terminal 0 is not up yet or the port differs.
-- empty plan / no points on the frame: the VLM did not emit `<|box_start|>` tokens, check `RAW plan` in terminal 1
+- empty plan / no points on the frame: the VLM output has no `point_2d` (or is not JSON), check `RAW plan` in terminal 1;
+  pass `--plan_format legacy` for a model trained on the old format
   and step 7.

@@ -1,9 +1,10 @@
 """Quick look at full-plan VLM predictions vs ground truth on a few jsonl rows.
+Works for both answer formats (native point_2d JSON and legacy <bbox>), detected from the row / output.
 
 Usage (robomme env, 1 GPU):
     CUDA_VISIBLE_DEVICES=0 python scripts/preview_plan_predictions.py \
-        --adapter runs/ckpts/vlm_plan_predictor/qwenvl/grounded_plan/<run>/checkpoint-XXX \
-        --jsonl data/robomme_preprocessed_data/qwenvl_plan/plan_train.jsonl \
+        --adapter runs/ckpts/vlm_plan_predictor/qwenvl/grounded_plan_lora/<run>/checkpoint-XXX \
+        --jsonl data/robomme_preprocessed_data/qwenvl_plan_native/plan_val.jsonl \
         --n 10 --per_task 1 --out runs/plan_preview.jsonl
 """
 
@@ -14,27 +15,48 @@ os.environ.setdefault("VIDEO_MAX_TOKEN_NUM", "64")
 os.environ.setdefault("FPS_MAX_FRAMES", "10")
 
 import argparse
+import importlib.util
 import json
 import random
-import re
 from collections import defaultdict
 
-BOX_RE = re.compile(r"<\|box_start\|>\((\d+),(\d+)\)<\|box_end\|>")
-IMAGE_SIZE = 256  # robomme front_rgb; Qwen3-VL emits coords normalized to 0..1000
+IMAGE_SIZE = 256  # robomme front_rgb
+
+
+def _load_plan_format():
+    """Import src/mme_vla_suite/dataset_builder/plan_format.py by path (pure python, works in any env)."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src", "mme_vla_suite",
+                        "dataset_builder", "plan_format.py")
+    spec = importlib.util.spec_from_file_location("plan_format", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+pf = _load_plan_format()
+
+
+def _flatten(steps: list[dict]) -> tuple[list[str], list[list[int]]]:
+    """plan_format steps -> (step texts with one <bbox> per point, flat [y, x] pixel points)."""
+    texts, pts = [], []
+    for s in steps:
+        t = s["template"].replace(pf.POINT_TOKEN, "at <bbox>")
+        # a step that has points but no placeholder in its text (e.g. model omitted it): append them
+        missing = len(s["points"]) - t.count("<bbox>")
+        if missing > 0:
+            t = t + " at <bbox>" * missing
+        texts.append(t)
+        pts.extend(s["points"])
+    return texts, pts
 
 
 def parse_pred(text: str) -> tuple[list[str], list[list[int]]]:
-    """Model output -> (steps with <bbox> placeholders, pixel points)."""
-    pts = [[int(int(a) * IMAGE_SIZE / 1000), int(int(b) * IMAGE_SIZE / 1000)] for a, b in BOX_RE.findall(text)]
-    text = BOX_RE.sub("<bbox>", text)
-    steps = [re.sub(r"^\d+\.\s*", "", s.strip()) for s in text.split(";") if s.strip()]
-    return steps, pts
+    """Model output (native point_2d JSON or legacy <|box_start|>) -> (steps with <bbox>, [y, x] pixel points)."""
+    return _flatten(pf.parse_answer(text, size=IMAGE_SIZE))
 
 
 def parse_gt(row: dict) -> tuple[list[str], list[list[int]]]:
-    text = row["messages"][2]["content"]
-    steps = [re.sub(r"^\d+\.\s*", "", s.strip()) for s in text.split(";") if s.strip()]
-    return steps, row["objects"]["bbox"]
+    return _flatten(pf.parse_row(row, size=IMAGE_SIZE))
 
 
 def point_step_ids(steps: list[str]) -> list[int]:
@@ -130,7 +152,7 @@ def load_rows(jsonl: str, n: int, per_task: int = 1, seed: int = 0,
 
 
 def run_preview(engine, rows: list[dict], vis_dir: str | None = None, out_jsonl: str | None = None,
-                max_tokens: int = 512, verbose: bool = True) -> dict:
+                max_tokens: int = 1024, verbose: bool = True) -> dict:
     """Greedy-decode every row, print GT vs PRED, optionally save images / jsonl. Returns summary metrics."""
     from swift.llm import InferRequest, RequestConfig
 
@@ -139,7 +161,7 @@ def run_preview(engine, rows: list[dict], vis_dir: str | None = None, out_jsonl:
     cfg = RequestConfig(max_tokens=max_tokens, temperature=0)
     outs = []
     for r in rows:  # batch=1: rows have different video/image sizes
-        d = {"messages": r["messages"][:2], "images": r["images"]}
+        d = {"messages": pf.prompt_messages(r), "images": r["images"]}
         if "videos" in r:
             d["videos"] = r["videos"]
         outs.append(engine.infer([InferRequest(**d)], request_config=cfg)[0].choices[0].message.content)
@@ -161,7 +183,8 @@ def run_preview(engine, rows: list[dict], vis_dir: str | None = None, out_jsonl:
 
         log("=" * 100)
         log(f"{task_of(r)} | {os.path.basename(r['images'][0])} | video={'videos' in r}")
-        log("goal:", r["messages"][1]["content"].split("\n")[0].replace("<video>", ""))
+        goal = pf.user_text(r).replace("<video>", "").replace("<image>", "").split("\n")[0]
+        log("goal:", goal)
         log(f"steps gt={len(gt_steps)} pred={len(pr_steps)} text_exact={exact} "
             f"bbox gt={len(gt_pts)} pred={len(pr_pts)} L1px={errs}")
         for i in range(max(len(gt_steps), len(pr_steps))):
@@ -201,11 +224,11 @@ def run_preview(engine, rows: list[dict], vis_dir: str | None = None, out_jsonl:
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--adapter", required=True, help="checkpoint dir: LoRA adapter or full fine-tune")
-    p.add_argument("--jsonl", default="data/robomme_preprocessed_data/qwenvl_plan/plan_train.jsonl")
+    p.add_argument("--jsonl", default="data/robomme_preprocessed_data/qwenvl_plan_native/plan_train.jsonl")
     p.add_argument("--n", type=int, default=10)
     p.add_argument("--per_task", type=int, default=1, help="rows per task before truncating to n")
     p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--max_tokens", type=int, default=512)
+    p.add_argument("--max_tokens", type=int, default=1024)
     p.add_argument("--out", default=None, help="optional jsonl with pred/gt per sample")
     p.add_argument("--vis_dir", default="runs/plan_preview_vis", help="where to save GT-vs-PRED images ('' to skip)")
     p.add_argument("--exclude_tasks", default=DEFAULT_EXCLUDE_TASKS, help="comma-separated, '' = keep all")

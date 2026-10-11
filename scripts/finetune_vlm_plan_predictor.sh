@@ -7,13 +7,18 @@
 #   EPOCHS=40 LR=3e-4 GPU_IDS=0,1 bash scripts/finetune_vlm_plan_predictor.sh  # override anything below
 #
 # The dataset is small (~1 row per episode), so what matters is the number of optimizer steps:
-#   steps ~= rows * EPOCHS / GLOBAL_BATCH.  ~1300 rows, 20 epochs, batch 16 -> ~1600 steps
-#   (the original subgoal script: 2 epochs, batch 64 -> only ~40 steps on this dataset).
+#   steps ~= rows * EPOCHS / GLOBAL_BATCH.
+# Reference: MemER / QwenVL subgoal predictors (scripts/finetune_vlm_subgoal_predictor.sh) use LoRA r=16, alpha=32,
+# lr 1e-4, global batch 64, 2 epochs; their released checkpoints are checkpoint-1200..1400, i.e. ~1300 optimizer
+# steps. We keep their LoRA/lr and choose EPOCHS so that the plan model also gets ~1300 steps:
+#   ~1100 train rows (14 tasks x ~90 episodes after the val split), batch 16, 20 epochs -> ~1400 steps.
+# (Memorizing a whole plan per sample is harder than one subgoal, and each episode appears once, so many passes are
+# needed; batch 16 instead of 64 gives 4x more updates for the same epochs.)
 
 # ---- data ----
 # Train on plan_train_split.jsonl / eval on plan_val.jsonl (made by scripts/split_plan_dataset.py, which also drops
 # the excluded tasks). VAL_DATASET='' trains without eval.
-DATA_DIR=${DATA_DIR:-'data/robomme_preprocessed_data/qwenvl_plan'}
+DATA_DIR=${DATA_DIR:-'data/robomme_preprocessed_data/qwenvl_plan_native'}
 DATASET_PATH=${DATASET_PATH:-$DATA_DIR/plan_train_split.jsonl}
 VAL_DATASET=${VAL_DATASET-$DATA_DIR/plan_val.jsonl}
 
@@ -28,13 +33,14 @@ if [ "$TRAIN_TYPE" == "full" ]; then
     PER_DEVICE=${PER_DEVICE:-2}
     TYPE_ARGS="--train_type full"
 else
-    LR=${LR:-2e-4}
+    # LoRA hyperparameters = the MemER / QwenVL subgoal predictor (finetune_vlm_subgoal_predictor.sh)
+    LR=${LR:-1e-4}
     EPOCHS=${EPOCHS:-20}
     FREEZE_ALIGNER=${FREEZE_ALIGNER:-true}
     DEEPSPEED=${DEEPSPEED:-zero2}
     PER_DEVICE=${PER_DEVICE:-4}
-    LORA_RANK=${LORA_RANK:-64}
-    LORA_ALPHA=${LORA_ALPHA:-128}
+    LORA_RANK=${LORA_RANK:-16}
+    LORA_ALPHA=${LORA_ALPHA:-32}
     TYPE_ARGS="--train_type lora --lora_rank $LORA_RANK --lora_alpha $LORA_ALPHA --target_modules all-linear"
 fi
 OUTPUT_DIR=${OUTPUT_DIR:-runs/ckpts/vlm_plan_predictor/qwenvl/grounded_plan_$TRAIN_TYPE}
@@ -85,7 +91,7 @@ swift sft \
     --padding_free false \
     --learning_rate $LR \
     --lr_scheduler_type cosine \
-    --warmup_ratio 0.03 \
+    --warmup_ratio 0.05 \
     --weight_decay 0.0 \
     --freeze_vit true \
     --freeze_aligner $FREEZE_ALIGNER \

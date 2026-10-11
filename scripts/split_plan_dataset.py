@@ -25,7 +25,7 @@ def episode_key(row: dict) -> tuple[str, int]:
 
 def main() -> None:
     p = argparse.ArgumentParser()
-    p.add_argument("--dir", default="data/robomme_preprocessed_data/qwenvl_plan")
+    p.add_argument("--dir", default="data/robomme_preprocessed_data/qwenvl_plan_native")
     p.add_argument("--val_per_task", type=int, default=10, help="held-out episodes per task")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--exclude_tasks", default=DEFAULT_EXCLUDE_TASKS, help="comma-separated, '' = keep all")

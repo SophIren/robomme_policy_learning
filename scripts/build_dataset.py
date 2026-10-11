@@ -64,6 +64,14 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Write visualization MP4s",
     )
+    parser.add_argument(
+        "--plan_format",
+        type=str,
+        default="native",
+        choices=["native", "legacy"],
+        help="vlm_plan_qwenvl only: native = Qwen3-VL point_2d JSON (-> qwenvl_plan_native/), "
+             "legacy = <bbox> + objects.bbox (-> qwenvl_plan/)",
+    )
     return parser.parse_args()
 
 
@@ -107,7 +115,8 @@ if __name__ == "__main__":
             preprocessed_data_path=args.preprocessed_data_path,
             max_episodes=args.max_episodes,
             visualize=args.visualize,
-            vlm_dir_name="qwenvl_plan",
+            vlm_dir_name="qwenvl_plan_native" if args.plan_format == "native" else "qwenvl_plan",
+            answer_format=args.plan_format,
         )
         builder.run()
     else:

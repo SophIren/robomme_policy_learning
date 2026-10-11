@@ -6,7 +6,7 @@ scripts/preview_plan_predictions.py. Only the objects whose GT point is on the *
 (the first step, buttons, static targets); later "moved" positions cannot be seen on this frame.
 
     CUDA_VISIBLE_DEVICES=0 python scripts/zeroshot_grounding_check.py \
-        --jsonl data/robomme_preprocessed_data/qwenvl_plan/plan_val.jsonl --n 10 --out_dir runs/zeroshot_grounding
+        --jsonl data/robomme_preprocessed_data/qwenvl_plan_native/plan_val.jsonl --n 10 --out_dir runs/zeroshot_grounding
 
 Native output format: Qwen3-VL is trained to answer grounding questions with JSON like
     [{"point_2d": [x, y], "label": "red cube"}]   or   [{"bbox_2d": [x1, y1, x2, y2], "label": ...}]
@@ -76,7 +76,7 @@ def parse_answer(text: str, coords: str) -> list[int] | None:
 
 def main() -> None:
     p = argparse.ArgumentParser()
-    p.add_argument("--jsonl", default="data/robomme_preprocessed_data/qwenvl_plan/plan_val.jsonl")
+    p.add_argument("--jsonl", default="data/robomme_preprocessed_data/qwenvl_plan_native/plan_val.jsonl")
     p.add_argument("--n", type=int, default=10)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--exclude_tasks", default=DEFAULT_EXCLUDE_TASKS)
