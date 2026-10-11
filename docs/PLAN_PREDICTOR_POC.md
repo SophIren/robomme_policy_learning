@@ -11,6 +11,7 @@ New files:
 - `scripts/build_dataset.py` (new `--dataset_type vlm_plan_qwenvl`)
 - `scripts/split_plan_dataset.py` (train/val split by episode)
 - `scripts/preview_plan_predictions.py` (GT vs prediction on a few samples)
+- `scripts/watch_plan_previews.py` (the same pictures for every checkpoint during training)
 
 Nothing was run locally (no data, no GPU). Run all steps below in the cloud, in order.
 
@@ -219,6 +220,59 @@ Read it: `eval_loss` going up while `loss` goes down = overfitting, pick the che
 count, pixel error) is measured by step 7 on `plan_val.jsonl`. Run step 7 on 1-2 checkpoints, it takes a minute.
 Most of the text is a template, so `loss` is dominated by coordinate tokens: a train loss that stays ~0.3-0.4 means
 the coordinates are not learned even on train.
+
+## 5a. Plan pictures during training (train + val, every checkpoint)
+
+`eval_loss` alone does not show whether the points land on objects, so the training script can render the same
+GT-vs-PRED pictures as step 7 for every saved checkpoint, on a few fixed train and val samples. Enable it with
+`PREVIEW_GPU`:
+
+```bash
+PREVIEW_GPU=1 GPU_IDS=0,1 bash scripts/finetune_vlm_plan_predictor.sh              # preview on GPU 1, shared with training
+PREVIEW_GPU=2 GPU_IDS=0,1 bash scripts/finetune_vlm_plan_predictor.sh              # separate GPU (best, if you have it)
+PREVIEW_GPU=1 PREVIEW_N=10 EVAL_STEPS=200 GPU_IDS=0,1 bash scripts/finetune_vlm_plan_predictor.sh
+```
+
+How it works: the script starts `scripts/watch_plan_previews.py` in the background. It polls the run dir and, for each
+new `checkpoint-<N>` (saved every `EVAL_STEPS`), loads it on `PREVIEW_GPU`, greedy-decodes `PREVIEW_N` train rows
+(from `DATASET_PATH`) and `PREVIEW_N` val rows (from `VAL_DATASET`), one per task, and writes:
+
+```
+<OUTPUT_DIR>/v<k>-<time>/
+├── preview/
+│   ├── checkpoint-100/{train,val}/<Task>_ep<i>_step<j>_vis.png   # pictures like in step 7
+│   ├── checkpoint-100/{train,val}.jsonl                          # raw / parsed GT and PRED
+│   ├── checkpoint-200/...
+│   └── metrics.jsonl                                             # one line per (checkpoint, split)
+└── runs/preview/                                                 # tensorboard: preview/{train,val}/<metric>
+```
+
+The samples are the same for every checkpoint (fixed seed), so you can flip through `checkpoint-*/train/<same file>`
+to see the points move towards the objects as training goes on. Metrics per split: `text_exact`, `same_len`,
+`mean_L1px`, `first_point_L1px` (error of the first point only, the one always visible on the input frame).
+
+```bash
+RUN=$(ls -d runs/ckpts/vlm_plan_predictor/qwenvl/grounded_plan_lora/v* | sort -V | tail -n 1)
+tail -f runs/ckpts/vlm_plan_predictor/qwenvl/grounded_plan_lora/preview_watcher.log
+cat $RUN/preview/metrics.jsonl
+scp -r <cloud-host>:<repo>/$RUN/preview .                                          # look at the pictures locally
+```
+
+Notes:
+- It runs in a separate process on the saved checkpoints, not inside the trainer, so it does not slow down or change
+  training; it only needs the checkpoints to exist. The decoding is greedy generation, i.e. the real model output,
+  unlike the teacher-forced `eval_token_acc`.
+- Memory: the 4B model in bf16 needs ~10 GB on `PREVIEW_GPU` (more for long video inputs). If it shares a GPU with
+  training and training OOMs, use another GPU or disable it (`PREVIEW_GPU=` is the default).
+- Each checkpoint takes ~1-2 min for 12 samples. If checkpoints come faster than that, it skips to the newest one;
+  with `--save_total_limit 3` older checkpoints may be gone before it gets to them (it logs and moves on).
+- After training ends it does a final pass over remaining checkpoints, then exits; the script waits for it.
+- For a run that already finished (or was started without previews):
+  ```bash
+  CUDA_VISIBLE_DEVICES=0 python scripts/watch_plan_previews.py --output_dir <OUTPUT_DIR> --run_dir $RUN --once
+  ```
+  With `--save_total_limit 3` only the last 3 checkpoints exist then.
+- Full-FT checkpoints work the same way (detected automatically).
 
 ## 6. Check predictions with swift infer (optional)
 

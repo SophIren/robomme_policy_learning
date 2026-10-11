@@ -108,6 +108,96 @@ def select_rows(rows: list[dict], n: int, per_task: int, seed: int) -> list[dict
     return picked[:n]
 
 
+BASE_MODEL = "Qwen/Qwen3-VL-4B-Instruct"
+DEFAULT_EXCLUDE_TASKS = "ButtonUnmaskSwap,PickHighlight"
+
+
+def load_engine(ckpt: str):
+    """LoRA checkpoint (has adapter_config.json) -> base + adapter; full fine-tune checkpoint -> the dir itself."""
+    from swift.llm import PtEngine
+
+    if os.path.exists(os.path.join(ckpt, "adapter_config.json")):
+        return PtEngine(model_id_or_path=BASE_MODEL, adapters=[ckpt], attn_impl="sdpa")
+    return PtEngine(model_id_or_path=ckpt, attn_impl="sdpa")
+
+
+def load_rows(jsonl: str, n: int, per_task: int = 1, seed: int = 0,
+              exclude_tasks: str = DEFAULT_EXCLUDE_TASKS) -> list[dict]:
+    exclude = {t for t in exclude_tasks.split(",") if t}
+    rows = [json.loads(l) for l in open(jsonl)]
+    rows = [r for r in rows if task_of(r) not in exclude]
+    return select_rows(rows, n, per_task, seed)
+
+
+def run_preview(engine, rows: list[dict], vis_dir: str | None = None, out_jsonl: str | None = None,
+                max_tokens: int = 512, verbose: bool = True) -> dict:
+    """Greedy-decode every row, print GT vs PRED, optionally save images / jsonl. Returns summary metrics."""
+    from swift.llm import InferRequest, RequestConfig
+
+    if vis_dir:
+        os.makedirs(vis_dir, exist_ok=True)
+    cfg = RequestConfig(max_tokens=max_tokens, temperature=0)
+    outs = []
+    for r in rows:  # batch=1: rows have different video/image sizes
+        d = {"messages": r["messages"][:2], "images": r["images"]}
+        if "videos" in r:
+            d["videos"] = r["videos"]
+        outs.append(engine.infer([InferRequest(**d)], request_config=cfg)[0].choices[0].message.content)
+
+    log = print if verbose else (lambda *a, **k: None)
+    n_exact_text, n_len_ok, px_errs = 0, 0, []
+    first_pt_errs = []
+    fout = open(out_jsonl, "w") if out_jsonl else None
+    for r, raw in zip(rows, outs):
+        gt_steps, gt_pts = parse_gt(r)
+        pr_steps, pr_pts = parse_pred(raw)
+        exact = gt_steps == pr_steps
+        n_exact_text += exact
+        n_len_ok += len(gt_steps) == len(pr_steps)
+        errs = [abs(a[0] - b[0]) + abs(a[1] - b[1]) for a, b in zip(gt_pts, pr_pts)]
+        px_errs += errs
+        if errs:
+            first_pt_errs.append(errs[0])
+
+        log("=" * 100)
+        log(f"{task_of(r)} | {os.path.basename(r['images'][0])} | video={'videos' in r}")
+        log("goal:", r["messages"][1]["content"].split("\n")[0].replace("<video>", ""))
+        log(f"steps gt={len(gt_steps)} pred={len(pr_steps)} text_exact={exact} "
+            f"bbox gt={len(gt_pts)} pred={len(pr_pts)} L1px={errs}")
+        for i in range(max(len(gt_steps), len(pr_steps))):
+            g = gt_steps[i] if i < len(gt_steps) else "-"
+            q = pr_steps[i] if i < len(pr_steps) else "-"
+            mark = "  " if g == q else "!!"
+            log(f"  {mark} {i + 1:2d}. GT  : {g}\n         PRED: {q}")
+        log("  GT pts  :", gt_pts)
+        log("  PRED pts:", pr_pts)
+        log("  RAW     :", raw)
+        if vis_dir:
+            vis_path = os.path.join(vis_dir, os.path.basename(r["images"][0]).replace(".png", "_vis.png"))
+            save_vis(r, gt_steps, gt_pts, pr_steps, pr_pts, vis_path)
+            log("  VIS     :", vis_path)
+        if fout:
+            fout.write(json.dumps({"task": task_of(r), "image": r["images"][0], "raw": raw,
+                                   "gt_steps": gt_steps, "pred_steps": pr_steps,
+                                   "gt_pts": gt_pts, "pred_pts": pr_pts}) + "\n")
+    if fout:
+        fout.close()
+
+    n = len(rows)
+    summary = {
+        "samples": n,
+        "text_exact": n_exact_text / max(n, 1),
+        "same_len": n_len_ok / max(n, 1),
+        "mean_L1px": sum(px_errs) / max(len(px_errs), 1),
+        "first_point_L1px": sum(first_pt_errs) / max(len(first_pt_errs), 1),
+    }
+    log("=" * 100)
+    log(f"samples={n} text_exact={n_exact_text}/{n} same_len={n_len_ok}/{n} "
+        f"mean_L1px={summary['mean_L1px']:.1f} (over {len(px_errs)} matched points) "
+        f"first_point_L1px={summary['first_point_L1px']:.1f}")
+    return summary
+
+
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--adapter", required=True, help="checkpoint dir: LoRA adapter or full fine-tune")
@@ -118,74 +208,12 @@ def main() -> None:
     p.add_argument("--max_tokens", type=int, default=512)
     p.add_argument("--out", default=None, help="optional jsonl with pred/gt per sample")
     p.add_argument("--vis_dir", default="runs/plan_preview_vis", help="where to save GT-vs-PRED images ('' to skip)")
-    p.add_argument("--exclude_tasks", default="ButtonUnmaskSwap,PickHighlight", help="comma-separated, '' = keep all")
+    p.add_argument("--exclude_tasks", default=DEFAULT_EXCLUDE_TASKS, help="comma-separated, '' = keep all")
     args = p.parse_args()
-    if args.vis_dir:
-        os.makedirs(args.vis_dir, exist_ok=True)
-    exclude = {t for t in args.exclude_tasks.split(",") if t}
 
-    from swift.llm import InferRequest, PtEngine, RequestConfig
-
-    rows = [json.loads(l) for l in open(args.jsonl)]
-    rows = [r for r in rows if task_of(r) not in exclude]
-    rows = select_rows(rows, args.n, args.per_task, args.seed)
-
-    if os.path.exists(os.path.join(args.adapter, "adapter_config.json")):
-        engine = PtEngine(model_id_or_path="Qwen/Qwen3-VL-4B-Instruct", adapters=[args.adapter], attn_impl="sdpa")
-    else:  # full fine-tune checkpoint
-        engine = PtEngine(model_id_or_path=args.adapter, attn_impl="sdpa")
-    cfg = RequestConfig(max_tokens=args.max_tokens, temperature=0)
-
-    reqs = []
-    for r in rows:
-        d = {"messages": r["messages"][:2], "images": r["images"]}
-        if "videos" in r:
-            d["videos"] = r["videos"]
-        reqs.append(InferRequest(**d))
-
-    outs = []
-    for r, req in zip(rows, reqs):  # batch=1: rows have different video/image sizes
-        outs.append(engine.infer([req], request_config=cfg)[0].choices[0].message.content)
-
-    n_exact_text, n_len_ok, px_errs = 0, 0, []
-    fout = open(args.out, "w") if args.out else None
-    for r, raw in zip(rows, outs):
-        gt_steps, gt_pts = parse_gt(r)
-        pr_steps, pr_pts = parse_pred(raw)
-        exact = gt_steps == pr_steps
-        n_exact_text += exact
-        n_len_ok += len(gt_steps) == len(pr_steps)
-        errs = [abs(a[0] - b[0]) + abs(a[1] - b[1]) for a, b in zip(gt_pts, pr_pts)]
-        px_errs += errs
-
-        print("=" * 100)
-        print(f"{task_of(r)} | {os.path.basename(r['images'][0])} | video={'videos' in r}")
-        print("goal:", r["messages"][1]["content"].split("\n")[0].replace("<video>", ""))
-        print(f"steps gt={len(gt_steps)} pred={len(pr_steps)} text_exact={exact} "
-              f"bbox gt={len(gt_pts)} pred={len(pr_pts)} L1px={errs}")
-        for i in range(max(len(gt_steps), len(pr_steps))):
-            g = gt_steps[i] if i < len(gt_steps) else "-"
-            q = pr_steps[i] if i < len(pr_steps) else "-"
-            mark = "  " if g == q else "!!"
-            print(f"  {mark} {i + 1:2d}. GT  : {g}\n         PRED: {q}")
-        print("  GT pts  :", gt_pts)
-        print("  PRED pts:", pr_pts)
-        print("  RAW     :", raw)
-        if args.vis_dir:
-            vis_path = os.path.join(args.vis_dir, os.path.basename(r["images"][0]).replace(".png", "_vis.png"))
-            save_vis(r, gt_steps, gt_pts, pr_steps, pr_pts, vis_path)
-            print("  VIS     :", vis_path)
-        if fout:
-            fout.write(json.dumps({"task": task_of(r), "image": r["images"][0], "raw": raw,
-                                   "gt_steps": gt_steps, "pred_steps": pr_steps,
-                                   "gt_pts": gt_pts, "pred_pts": pr_pts}) + "\n")
-    if fout:
-        fout.close()
-
-    n = len(rows)
-    print("=" * 100)
-    print(f"samples={n} text_exact={n_exact_text}/{n} same_len={n_len_ok}/{n} "
-          f"mean_L1px={sum(px_errs) / max(len(px_errs), 1):.1f} (over {len(px_errs)} matched points)")
+    rows = load_rows(args.jsonl, args.n, args.per_task, args.seed, args.exclude_tasks)
+    engine = load_engine(args.adapter)
+    run_preview(engine, rows, vis_dir=args.vis_dir or None, out_jsonl=args.out, max_tokens=args.max_tokens)
 
 
 if __name__ == "__main__":

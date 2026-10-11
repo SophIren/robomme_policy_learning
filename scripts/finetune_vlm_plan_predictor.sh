@@ -61,6 +61,29 @@ echo "GPU_IDS=$GPU_IDS NUM_GPUS=$NUM_GPUS PER_DEVICE=$PER_DEVICE GRAD_ACC=$GRAD_
 echo "train=$DATASET_PATH val=${VAL_DATASET:-none} out=$OUTPUT_DIR"
 [ -f "$DATASET_PATH" ] && echo "train rows: $(wc -l < "$DATASET_PATH") -> ~$(( $(wc -l < "$DATASET_PATH") * EPOCHS / (PER_DEVICE * GRAD_ACC * NUM_GPUS) )) optimizer steps"
 
+# ---- plan previews (GT vs PRED images) for every saved checkpoint ----
+# PREVIEW_GPU=<id> starts scripts/watch_plan_previews.py in the background on that GPU. It can be one of GPU_IDS
+# (needs ~10 GB free for the 4B model in bf16) or a separate one. PREVIEW_GPU='' disables it.
+# Images: <OUTPUT_DIR>/v*/preview/checkpoint-<N>/{train,val}/*_vis.png, metrics: <OUTPUT_DIR>/v*/preview/metrics.jsonl
+PREVIEW_GPU=${PREVIEW_GPU-}
+PREVIEW_N=${PREVIEW_N:-6}
+if [ -n "$PREVIEW_GPU" ]; then
+    mkdir -p "$OUTPUT_DIR"
+    rm -f "$OUTPUT_DIR/.training_done"
+    PREVIEW_LOG="$OUTPUT_DIR/preview_watcher.log"
+    VAL_ARG=()
+    [ -n "$VAL_DATASET" ] && VAL_ARG=(--val_jsonl "$VAL_DATASET") || VAL_ARG=(--val_jsonl "")
+    CUDA_VISIBLE_DEVICES=$PREVIEW_GPU IMAGE_MAX_TOKEN_NUM=256 VIDEO_MAX_TOKEN_NUM=64 FPS_MAX_FRAMES=10 \
+    python "$(dirname "$0")/watch_plan_previews.py" \
+        --output_dir "$OUTPUT_DIR" --train_jsonl "$DATASET_PATH" "${VAL_ARG[@]}" \
+        --n_train "$PREVIEW_N" --n_val "$PREVIEW_N" --parent_pid $$ --stop_file "$OUTPUT_DIR/.training_done" \
+        > "$PREVIEW_LOG" 2>&1 &
+    PREVIEW_PID=$!
+    echo "plan previews: pid $PREVIEW_PID on GPU $PREVIEW_GPU, log $PREVIEW_LOG"
+    # the watcher does a final pass after training ends and then exits by itself; Ctrl-C stops it too
+    trap 'kill $PREVIEW_PID 2>/dev/null' INT TERM
+fi
+
 PYTORCH_ALLOC_CONF='expandable_segments:True' \
 IMAGE_MAX_TOKEN_NUM=256 \
 VIDEO_MAX_TOKEN_NUM=64 \
@@ -96,3 +119,11 @@ swift sft \
     --deepspeed $DEEPSPEED \
     --dataset_num_proc 4 \
     --dataloader_num_workers 4
+TRAIN_STATUS=$?
+
+if [ -n "$PREVIEW_PID" ]; then
+    echo "training finished (exit $TRAIN_STATUS); waiting for the preview watcher to finish the last checkpoint..."
+    touch "$OUTPUT_DIR/.training_done"   # watcher: do a final pass over remaining checkpoints, then exit
+    wait $PREVIEW_PID
+fi
+exit $TRAIN_STATUS
