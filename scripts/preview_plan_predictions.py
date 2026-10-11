@@ -110,7 +110,7 @@ def select_rows(rows: list[dict], n: int, per_task: int, seed: int) -> list[dict
 
 def main() -> None:
     p = argparse.ArgumentParser()
-    p.add_argument("--adapter", required=True)
+    p.add_argument("--adapter", required=True, help="checkpoint dir: LoRA adapter or full fine-tune")
     p.add_argument("--jsonl", default="data/robomme_preprocessed_data/qwenvl_plan/plan_train.jsonl")
     p.add_argument("--n", type=int, default=10)
     p.add_argument("--per_task", type=int, default=1, help="rows per task before truncating to n")
@@ -118,16 +118,22 @@ def main() -> None:
     p.add_argument("--max_tokens", type=int, default=512)
     p.add_argument("--out", default=None, help="optional jsonl with pred/gt per sample")
     p.add_argument("--vis_dir", default="runs/plan_preview_vis", help="where to save GT-vs-PRED images ('' to skip)")
+    p.add_argument("--exclude_tasks", default="ButtonUnmaskSwap,PickHighlight", help="comma-separated, '' = keep all")
     args = p.parse_args()
     if args.vis_dir:
         os.makedirs(args.vis_dir, exist_ok=True)
+    exclude = {t for t in args.exclude_tasks.split(",") if t}
 
     from swift.llm import InferRequest, PtEngine, RequestConfig
 
     rows = [json.loads(l) for l in open(args.jsonl)]
+    rows = [r for r in rows if task_of(r) not in exclude]
     rows = select_rows(rows, args.n, args.per_task, args.seed)
 
-    engine = PtEngine(model_id_or_path="Qwen/Qwen3-VL-4B-Instruct", adapters=[args.adapter], attn_impl="sdpa")
+    if os.path.exists(os.path.join(args.adapter, "adapter_config.json")):
+        engine = PtEngine(model_id_or_path="Qwen/Qwen3-VL-4B-Instruct", adapters=[args.adapter], attn_impl="sdpa")
+    else:  # full fine-tune checkpoint
+        engine = PtEngine(model_id_or_path=args.adapter, attn_impl="sdpa")
     cfg = RequestConfig(max_tokens=args.max_tokens, temperature=0)
 
     reqs = []

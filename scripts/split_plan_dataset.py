@@ -1,7 +1,10 @@
-"""Split plan_train.jsonl into train/val by episode (not by row).
+"""Split plan_train.jsonl into train/val by episode (not by row), dropping excluded tasks.
 
     python scripts/split_plan_dataset.py --val_per_task 10
 -> <dir>/plan_train_split.jsonl, <dir>/plan_val.jsonl
+
+By default ButtonUnmaskSwap and PickHighlight are excluded from both train and val (they do not fit the
+"plan from the first frame" setup yet). Pass --exclude_tasks "" to keep all tasks.
 """
 
 import argparse
@@ -9,6 +12,8 @@ import json
 import os
 import random
 from collections import defaultdict
+
+DEFAULT_EXCLUDE_TASKS = "ButtonUnmaskSwap,PickHighlight"
 
 
 def episode_key(row: dict) -> tuple[str, int]:
@@ -23,9 +28,14 @@ def main() -> None:
     p.add_argument("--dir", default="data/robomme_preprocessed_data/qwenvl_plan")
     p.add_argument("--val_per_task", type=int, default=10, help="held-out episodes per task")
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--exclude_tasks", default=DEFAULT_EXCLUDE_TASKS, help="comma-separated, '' = keep all")
     args = p.parse_args()
+    exclude = {t for t in args.exclude_tasks.split(",") if t}
 
     rows = [json.loads(l) for l in open(os.path.join(args.dir, "plan_train.jsonl"))]
+    n_all = len(rows)
+    rows = [r for r in rows if episode_key(r)[0] not in exclude]
+    print(f"excluded tasks: {sorted(exclude) or 'none'} ({n_all - len(rows)} rows dropped)")
     eps = defaultdict(set)
     for r in rows:
         t, e = episode_key(r)

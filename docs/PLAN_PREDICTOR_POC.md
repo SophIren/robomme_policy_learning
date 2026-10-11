@@ -149,30 +149,67 @@ cat data/robomme_preprocessed_data/qwenvl_plan/plan_val_episodes.json | head
 It splits by **episode**, not by row (with `frame_offsets` several rows share one episode/plan), randomly with a
 fixed seed, `--val_per_task` episodes per task. Same task distribution in train and val.
 
+**Excluded tasks.** By default `ButtonUnmaskSwap` and `PickHighlight` are dropped from both train and val
+(`--exclude_tasks "ButtonUnmaskSwap,PickHighlight"`; pass `--exclude_tasks ""` to keep them). The same default is used
+by `preview_plan_predictions.py` (step 7) and `interactive_plan.py` (step 8, refuses these tasks unless `--force`).
+`plan_train.jsonl` itself keeps all tasks, so changing the list only needs a re-run of the split.
+
 ## 5. Real training (with val metrics)
 
+The previous config (2 epochs, global batch 64, LoRA r=16, lr 1e-4) gave only ~40 optimizer steps on ~1.3k rows, which
+is why the model did not even fit the training set. New defaults are sized for this small dataset:
+
+| | LoRA (default) | full FT (`TRAIN_TYPE=full`) |
+|---|---|---|
+| trainable | LoRA r=64, alpha=128, all-linear | whole LLM + aligner (ViT frozen) |
+| lr | 2e-4 | 1e-5 |
+| epochs | 20 | 15 |
+| global batch | 16 | 16 |
+| per-device batch | 4 | 2 |
+| deepspeed | zero2 | zero3 |
+| scheduler | cosine, warmup 3%, no weight decay | same |
+| ~optimizer steps on 1.3k rows | ~1600 | ~1200 |
+
+The script prints the row count and the expected number of optimizer steps before starting.
+
 ```bash
-GPU_IDS=0,1 bash scripts/finetune_vlm_plan_predictor.sh
+GPU_IDS=0,1 bash scripts/finetune_vlm_plan_predictor.sh                     # LoRA
+TRAIN_TYPE=full GPU_IDS=0,1 bash scripts/finetune_vlm_plan_predictor.sh     # full fine-tune
 ```
 
-Defaults: train on `plan_train_split.jsonl`, eval on `plan_val.jsonl` every `EVAL_STEPS=25` steps, checkpoint at
-the same steps (keep last 3). Overrides via env vars:
+Any value can be overridden with an env var: `EPOCHS`, `LR`, `GLOBAL_BATCH`, `PER_DEVICE`, `GRAD_ACC`,
+`LORA_RANK`, `LORA_ALPHA`, `FREEZE_ALIGNER`, `DEEPSPEED`, `EVAL_STEPS` (default 100), `DATASET_PATH`, `VAL_DATASET`,
+`OUTPUT_DIR`. Examples:
 
 ```bash
-EVAL_STEPS=10 GPU_IDS=0,1 bash scripts/finetune_vlm_plan_predictor.sh             # eval more often
+EPOCHS=40 LR=3e-4 GPU_IDS=0,1 bash scripts/finetune_vlm_plan_predictor.sh          # push LoRA harder
+TRAIN_TYPE=full PER_DEVICE=1 GPU_IDS=0,1 bash scripts/finetune_vlm_plan_predictor.sh  # full FT on OOM
 DATASET_PATH=data/robomme_preprocessed_data/qwenvl_plan/plan_train.jsonl VAL_DATASET= \
   GPU_IDS=0,1 bash scripts/finetune_vlm_plan_predictor.sh                         # final run on all data, no eval
 ```
 
-Other differences from `finetune_vlm_subgoal_predictor.sh`: `--max_length 4096`, `--logging_steps 5`, GPU count from
-`GPU_IDS`. With ~one row per episode, 2 epochs may be too few; raise `--num_train_epochs` (e.g. 5-10) and watch val.
+Note: `DATASET_PATH=.../plan_train.jsonl` includes the excluded tasks; filter them first if you train on it.
 
-What is logged (`runs/ckpts/vlm_plan_predictor/qwenvl/grounded_plan/v*/logging.jsonl`, and tensorboard in `runs/`):
+Which to pick:
+- First confirm the model can fit the **train** set: LoRA with the new defaults, then step 7 on
+  `plan_train_split.jsonl`. Train-set points should be within a few px. If train loss plateaus well above ~0.05
+  and train points stay off, raise `EPOCHS` / `LR`, then try `TRAIN_TYPE=full`.
+- Full FT has much more capacity and usually fits small datasets faster, but overfits faster too and each checkpoint
+  is ~8 GB (`--save_total_limit 3`). Memory: 4B params in bf16 + Adam states sharded with zero3 over 2 GPUs fit in
+  ~40-48 GB per GPU at `PER_DEVICE=2` with gradient checkpointing (estimate, not measured); drop to `PER_DEVICE=1`
+  on OOM, the script keeps the global batch by raising `GRAD_ACC`.
+- Full FT trains the aligner too (`FREEZE_ALIGNER=false`); the ViT stays frozen in both modes.
+
+Output: `runs/ckpts/vlm_plan_predictor/qwenvl/grounded_plan_lora/` or `.../grounded_plan_full/`. A full-FT
+checkpoint is a whole model, not an adapter; `preview_plan_predictions.py` and `interactive_plan.py` detect this
+automatically (no `adapter_config.json` -> load the checkpoint dir as the model), pass it the same way via `--adapter`.
+
+What is logged (`<OUTPUT_DIR>/v*/logging.jsonl`, and tensorboard in `runs/`):
 - train: `loss`, `token_acc`
 - val: `eval_loss`, `eval_token_acc` (teacher-forced, on the answer tokens incl. coordinates)
 
 ```bash
-RUN=$(ls -d runs/ckpts/vlm_plan_predictor/qwenvl/grounded_plan/v* | sort -V | tail -n 1)
+RUN=$(ls -d runs/ckpts/vlm_plan_predictor/qwenvl/grounded_plan_lora/v* | sort -V | tail -n 1)
 grep eval_loss $RUN/logging.jsonl | tail
 tensorboard --logdir $RUN/runs --port 6006
 ```
@@ -180,13 +217,15 @@ tensorboard --logdir $RUN/runs --port 6006
 Read it: `eval_loss` going up while `loss` goes down = overfitting, pick the checkpoint at the `eval_loss` minimum.
 `eval_token_acc` is teacher-forced, so it is optimistic; the real generation quality (whole plan exact, step
 count, pixel error) is measured by step 7 on `plan_val.jsonl`. Run step 7 on 1-2 checkpoints, it takes a minute.
+Most of the text is a template, so `loss` is dominated by coordinate tokens: a train loss that stays ~0.3-0.4 means
+the coordinates are not learned even on train.
 
 ## 6. Check predictions with swift infer (optional)
 
 Inference on val rows, bypassing the env. Use the latest checkpoint dir:
 
 ```bash
-CKPT=$(ls -d runs/ckpts/vlm_plan_predictor/qwenvl/grounded_plan/v*/checkpoint-* | sort -V | tail -n 1)
+CKPT=$(ls -d runs/ckpts/vlm_plan_predictor/qwenvl/grounded_plan_lora/v*/checkpoint-* | sort -V | tail -n 1)
 echo $CKPT
 IMAGE_MAX_TOKEN_NUM=256 VIDEO_MAX_TOKEN_NUM=64 FPS_MAX_FRAMES=10 CUDA_VISIBLE_DEVICES=0 \
 swift infer --adapters $CKPT --infer_backend pt --temperature 0 --max_new_tokens 512 \
@@ -198,7 +237,7 @@ Raw dump of predictions; step 7 gives a readable GT-vs-PRED diff with metrics.
 ## 7. Quick look at ~10 predictions vs ground truth
 
 ```bash
-CKPT=$(ls -d runs/ckpts/vlm_plan_predictor/qwenvl/grounded_plan/v*/checkpoint-* | sort -V | tail -n 1)
+CKPT=$(ls -d runs/ckpts/vlm_plan_predictor/qwenvl/grounded_plan_lora/v*/checkpoint-* | sort -V | tail -n 1)
 CUDA_VISIBLE_DEVICES=0 python scripts/preview_plan_predictions.py \
   --adapter $CKPT \
   --jsonl data/robomme_preprocessed_data/qwenvl_plan/plan_val.jsonl \
@@ -253,7 +292,7 @@ CUDA_VISIBLE_DEVICES=0 uv run scripts/serve_policy.py --seed=7 --port=8006 polic
 
 # terminal 1: sim + plan VLM + web UI (robomme env)
 micromamba activate robomme
-CKPT=$(ls -d runs/ckpts/vlm_plan_predictor/qwenvl/grounded_plan/v*/checkpoint-* | sort -V | tail -n 1)
+CKPT=$(ls -d runs/ckpts/vlm_plan_predictor/qwenvl/grounded_plan_lora/v*/checkpoint-* | sort -V | tail -n 1)
 CUDA_VISIBLE_DEVICES=1 python examples/robomme/interactive_plan.py --port 8006 \
   --adapter $CKPT --task MoveCube --episodes 0,1 --ui_port 8890
 
@@ -303,6 +342,7 @@ Outputs in `runs/evaluation/plan_poc/<Task>_ep<i>/`:
 Suggested PoC set (a few episodes each): one without video (`PickXtimes`, `ButtonUnmask`), one with video
 (`MoveCube`, `VideoPlaceOrder`), one long counting task (`BinFill`). For each, compare: success with your plan vs the
 same episode with `--plan_file` built from the oracle hints; that isolates planner errors from switching errors.
+`ButtonUnmaskSwap` and `PickHighlight` are refused by default (excluded from training); `--force` runs them anyway.
 
 Troubleshooting:
 - page loads but no image: the planner is still running (first call loads the model); watch terminal 1.

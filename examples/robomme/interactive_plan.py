@@ -51,6 +51,18 @@ PLAN_USER_PROMPT = (
 BOX_RE = re.compile(r"<\|box_start\|>\((\d+),(\d+)\)<\|box_end\|>")
 POINT_RE = re.compile(r"<(\d+), (\d+)>")
 IMAGE_SIZE = 256
+BASE_MODEL = "Qwen/Qwen3-VL-4B-Instruct"
+
+
+def load_engine(ckpt: str):
+    """LoRA checkpoint (adapter_config.json) -> base + adapter; full fine-tune checkpoint -> load the dir itself."""
+    from swift.llm import PtEngine
+
+    if os.path.exists(os.path.join(ckpt, "adapter_config.json")):
+        print(f"Loading {BASE_MODEL} + LoRA adapter {ckpt}")
+        return PtEngine(model_id_or_path=BASE_MODEL, adapters=[ckpt], attn_impl="sdpa")
+    print(f"Loading full fine-tuned model {ckpt}")
+    return PtEngine(model_id_or_path=ckpt, attn_impl="sdpa")
 
 
 # -----------------------------------------------------------------------------
@@ -59,11 +71,8 @@ IMAGE_SIZE = 256
 
 
 class PlanPredictor:
-    def __init__(self, adapter: str):
-        from swift.llm import PtEngine
-
-        print(f"Loading Qwen3-VL-4B-Instruct + adapter {adapter}")
-        self.engine = PtEngine(model_id_or_path="Qwen/Qwen3-VL-4B-Instruct", adapters=[adapter], attn_impl="sdpa")
+    def __init__(self, ckpt: str):
+        self.engine = load_engine(ckpt)
 
     def predict(self, task_goal: str, image: np.ndarray, video: list | None, work_dir: Path) -> tuple[list[str], str]:
         from swift.llm import InferRequest, RequestConfig
@@ -359,9 +368,12 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=8006, help="VLA policy server port")
-    p.add_argument("--adapter", default=None, help="plan VLM LoRA checkpoint")
+    p.add_argument("--adapter", default=None, help="plan VLM checkpoint dir (LoRA adapter or full fine-tune)")
     p.add_argument("--plan_file", default=None, help="json list of subgoals instead of the VLM (debug switching)")
     p.add_argument("--task", default="MoveCube")
+    p.add_argument("--exclude_tasks", default="ButtonUnmaskSwap,PickHighlight",
+                   help="tasks the plan model does not support yet; refused unless --force")
+    p.add_argument("--force", action="store_true", help="run an excluded task anyway")
     p.add_argument("--episodes", default="0", help="comma-separated episode ids")
     p.add_argument("--dataset", default="test", choices=["train", "val", "test"])
     p.add_argument("--max_steps", type=int, default=1300)
@@ -373,6 +385,8 @@ def main():
     args = p.parse_args()
     args.use_history = not args.no_history
     assert args.adapter or args.plan_file, "pass --adapter or --plan_file"
+    if args.task in {t for t in args.exclude_tasks.split(",") if t} and not args.force:
+        raise SystemExit(f"{args.task} is excluded for the plan model (--exclude_tasks); pass --force to run it anyway")
 
     planner = PlanPredictor(args.adapter) if args.adapter else None
     ui, step_ref = UIState(), {"step": 0}
