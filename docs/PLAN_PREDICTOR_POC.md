@@ -4,10 +4,10 @@ One sample = one episode. Input: video demo (if any) + task goal + first executi
 Output: the whole plan with object points in **Qwen3-VL's native grounding format** (default, `--plan_format native`):
 
 ```json
-[{"step": 1, "subgoal": "pick up the red cube <point> for the first time", "label": "the red cube", "point_2d": [469, 426]},
- {"step": 2, "subgoal": "place the red cube onto the target <point>", "label": "the target", "point_2d": [574, 410]},
- {"step": 3, "subgoal": "drop the cube onto table"},
- {"step": 4, "subgoal": "press the button <point> to stop", "label": "the button", "point_2d": [516, 254]}]
+[{"subgoal": "pick up the red cube <point> for the first time", "point_2d": [469, 426]},
+ {"subgoal": "place the red cube onto the target <point>", "point_2d": [574, 410]},
+ {"subgoal": "drop the cube onto table"},
+ {"subgoal": "press the button <point> to stop", "point_2d": [516, 254]}]
 ```
 
 Why this format: zero-shot the base model already points well at cubes / buttons when asked in its own format
@@ -17,7 +17,15 @@ the opposite axis order, so the model had to relearn grounding from ~1k samples.
 exactly like in pretraining; only the surrounding plan structure is new.
 - `point_2d` = `[x, y]`, `x = col * 1000 / 256`, `y = row * 1000 / 256` (rounded); converted back to RoboMME
   `[y, x]` pixels in 0..255 everywhere outside the model (`plan_format.rel_to_px`).
-- `label` = the object phrase from the subgoal (`the red cube`, `the button`, `the right-side target`), as in pretraining.
+- No `label` field (unlike pretraining): object phrases repeat across steps (`the right cube` twice), so a label
+  does not identify the object; the subgoal text already names it. No `step` index either: list order = step order.
+  The coordinate convention (`point_2d`, `[x, y]`, 0..1000) is what is kept from pretraining.
+- A step with several objects has `"point_2d": [[x1, y1], [x2, y2]]`, in the order of the `<point>`s in the subgoal.
+- The parser is lenient: if a model writes the coordinates under another key (e.g. a checkpoint trained on the first
+  native version put `"label": [x, y]` or a nested `"label": [{"label": [x, y]}, ...]`), all number pairs of the step
+  except the subgoal text are taken as its points, in order. Only top-level items with a `"subgoal"` are steps.
+  Truncated JSON is cut back to the last complete step. `interactive_plan.py` prints a warning for a `<point>` that
+  got no coordinate.
 - `<point>` marks where `at <y, x>` was in the original grounded subgoal, so the exact VLA string is rebuilt from it
   (`plan_format.to_vla_subgoal`: `pick up the red cube at <109, 120> for the first time`).
 - No custom system prompt (default chat template), the instruction is in the user turn.
@@ -105,8 +113,7 @@ EOF
 ```
 
 Must hold:
-- every answer is valid JSON; every step with `point_2d` has a `label` (if a label is missing, the subgoal phrase did
-  not match `the ... <point>`; harmless, but check a few);
+- every answer is valid JSON; the number of `<point>` in each subgoal equals the number of `point_2d` pairs;
 - the rebuilt VLA subgoals (`to_vla_subgoal`) equal the original grounded subgoals from the h5, up to +-1 px rounding;
 - plans look sane: steps in the right order, no `complete`;
 - the user prompt contains `<video>` iff `videos` is present; the image is the first execution frame.
@@ -380,7 +387,7 @@ Points of later steps are drawn on the first frame even though the object will b
 expected and shows what the planner "assumes" about future positions.
 
 How to read it:
-- `RAW` (native format) should be a JSON list with `"point_2d": [x, y]` (0..1000, x first) and a `"label"` for every
+- `RAW` (native format) should be a JSON list of `{"subgoal": ..., "point_2d": [x, y]}` (0..1000, x first) for every
   object step; the script converts them to `[y, x]` pixels in 0..255. If `RAW` is not valid JSON the parser keeps the
   complete `{...}` items (truncated output: raise `--max_tokens`). Legacy-format models output
   `<|box_start|>(y,x)<|box_end|>` instead; both are parsed automatically.

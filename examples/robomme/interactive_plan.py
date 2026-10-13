@@ -95,7 +95,11 @@ class PlanPredictor:
 
 def parse_plan(raw: str) -> list[str]:
     """Model output (native point_2d JSON or legacy <|box_start|>) -> VLA subgoals '... at <y, x> ...' in pixels."""
-    return [pf.to_vla_subgoal(s) for s in pf.parse_answer(raw, size=IMAGE_SIZE)]
+    steps = pf.parse_answer(raw, size=IMAGE_SIZE)
+    for i, s in enumerate(steps):
+        if pf.missing_points(s):
+            print(f"  WARNING step {i}: {pf.missing_points(s)} <point> without coordinates in {s['template']!r}")
+    return [pf.to_vla_subgoal(s) for s in steps if s["template"]]
 
 
 # -----------------------------------------------------------------------------
